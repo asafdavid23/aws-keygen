@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  aws-keygen
+
+  Sample SAM Template for aws-keygen
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+
+    # You can add LoggingConfig parameters such as the Logformat, Log Group, and SystemLogLevel or ApplicationLogLevel. Learn more here https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-resource-function.html#sam-function-loggingconfig.
+    LoggingConfig:
+      LogFormat: JSON
+Resources:
+  AWSKeygenDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: aws-keygen-data
+      AttributeDefinitions:
+        - AttributeName: request_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: request_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  NotifierSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AWS Keygen Notifier
+      TopicName: aws-keygen-notifier
+
+  AWSKeygenApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        ApiKeyRequired: true
+
+  AWSKeygenStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AWSKeygenStateMachinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ControllerFunction.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt NotifierFunction.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ApproverFunction.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DBHandlerFunction.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AssumerFunction.Arn
+  
+  AWSKeygenStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt AWSKeygenStateMachineRole.Arn
+      DefinitionString: |
+            {
+              "Comment": "AWS Keygen State Machine",
+              "StartAt": "NotiferStep",
+              "States": {
+                "NotiferStep": {
+                  "Type": "Task",
+                  "Resource": !GetAtt NotifierFunction.Arn,
+                  "ResultPath": "$.notifier",
+                  "Next": "ApproverStep"
+                },
+                "ApproverStep": {
+                  "Type": "Task",
+                  "Resource": !GetAtt ApproverFunction.Arn,
+                  "InputPath": "$.notifier",
+                  "ResultPath": "$.approver",
+                  "Next": "AssumerStep"
+                },
+                "CombineResults": {
+                  "Type": "Pass",
+                  "Result": {
+                    "parsedPayload": "$",
+                    "approvalStatus": "$.approver",
+                  },
+                  "ResultPath": "$.combinedResults",
+                  "Next": "DBHandlerStep"
+                },
+                "DBHandlerStep": {
+                  "Type": "Task",
+                  "Resource": !GetAtt DBHandlerFunction.Arn,
+                  "InputPath": "$.combinedResults",
+                  "ResultPath": "$.dbhandler",
+                  "Next": "AssumerStep"
+                },
+                "AssumerStep": {
+                  "Type": "Task",
+                  "Resource": !GetAtt AssumerFunction.Arn,
+                  "InputPath": "$.dbhandler",
+                  "End": true
+                }
+
+              }
+            }
+
+  ControllerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      Runtime: python3.12
+      CodeUri: handlers/controller/
+      Description: Lambda function to control key requests
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: DEBUG
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      Runtime: python3.12
+      CodeUri: handlers/notifier/
+      Description: Lambda function to send notifications about new keys requested
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: DEBUG
+          TOPIC_NAME: aws-keygen-notifier
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName:
+              !Ref NotifierSnsTopic
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ApproverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      Runtime: python3.12
+      CodeUri: handlers/approver/
+      Description: Lambda function to approve key requests
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: DEBUG
+          APPROVAL_API_URL: !Ref AWSKeygenApi
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  DBHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      Runtime: python3.12
+      CodeUri: handlers/dbhandler/
+      Description: Lambda function to handle data in the database
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: DEBUG
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  
+  AssumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main.lambda_handler
+      Runtime: python3.12
+      CodeUri: handlers/assumer/
+      Description: Lambda function to assume roles
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          LOG_LEVEL: DEBUG
+      Policies:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
